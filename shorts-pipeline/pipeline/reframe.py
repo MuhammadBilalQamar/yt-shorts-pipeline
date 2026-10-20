@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .common import ROOT, log
+from .common import ROOT, hw_decode_flags, log
 
 SAMPLE_FPS = 5
 PROBE_W = 640
@@ -31,38 +31,38 @@ def _yunet_path() -> Path | None:
 
 
 class FaceDetector:
+    """YuNet (OpenCV DNN). OpenCV 5 removed the Haar cascades, so there is no cascade fallback;
+    if the model can't be loaded the clip is rendered in blur/pillarbox mode instead."""
+
     def __init__(self, w: int, h: int):
         import cv2
 
-        self.cv2 = cv2
-        self.kind = "haar"
+        self.kind = "none"
+        self.det = None
         model = _yunet_path()
         if model is not None and hasattr(cv2, "FaceDetectorYN"):
             try:
                 self.det = cv2.FaceDetectorYN.create(str(model), "", (w, h), score_threshold=0.6)
+                self.det.setInputSize((w, h))
                 self.kind = "yunet"
             except Exception as exc:  # noqa: BLE001
-                log.warning("YuNet init failed (%s); using Haar", exc)
-        if self.kind == "haar":
-            self.det = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+                log.warning("YuNet init failed (%s); subject tracking disabled", exc)
 
     def __call__(self, frame) -> list[tuple[float, float, float, float]]:
         """Returns [(x, y, w, h)] in pixel coords of the given frame."""
-        if self.kind == "yunet":
-            _, faces = self.det.detect(frame)
-            if faces is None:
-                return []
-            return [(float(f[0]), float(f[1]), float(f[2]), float(f[3])) for f in faces]
-        gray = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2GRAY)
-        faces = self.det.detectMultiScale(gray, 1.15, 5, minSize=(24, 24))
-        return [(float(x), float(y), float(w), float(h)) for (x, y, w, h) in faces]
+        if self.det is None:
+            return []
+        _, faces = self.det.detect(frame)
+        if faces is None:
+            return []
+        return [(float(f[0]), float(f[1]), float(f[2]), float(f[3])) for f in faces]
 
 
-def _frames(src: str, start: float, dur: float, w: int, h: int):
-    cmd = [
-        "ffmpeg", "-v", "error", "-hwaccel", "videotoolbox", "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", src,
-        "-vf", f"fps={SAMPLE_FPS},scale={w}:{h}", "-pix_fmt", "bgr24", "-f", "rawvideo", "-",
-    ]
+def _frames(src: str, start: float, dur: float, w: int, h: int, hw: list[str]):
+    cmd = (
+        ["ffmpeg", "-v", "error"] + hw + ["-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", src,
+        "-vf", f"fps={SAMPLE_FPS},scale={w}:{h}", "-pix_fmt", "bgr24", "-f", "rawvideo", "-"]
+    )
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     size = w * h * 3
     try:
@@ -76,6 +76,17 @@ def _frames(src: str, start: float, dur: float, w: int, h: int):
         proc.wait()
 
 
+def _sample(src: str, start: float, dur: float, w: int, h: int, hw: list[str]):
+    """Yield probe frames; retry with software decode if the hardware path yields nothing."""
+    got = False
+    for f in _frames(src, start, dur, w, h, hw):
+        got = True
+        yield f
+    if not got and hw:
+        log.debug("hw-decoded probe produced no frames; retrying in software")
+        yield from _frames(src, start, dur, w, h, [])
+
+
 def camera_path(cfg: dict, clip: dict, info: dict, scene_cuts: list[float]) -> dict:
     """Returns {'mode': 'crop'|'blur', 'coverage': f, 'keyframes': [(t_rel, cx_norm), ...]}."""
     rcfg = cfg["render"]
@@ -86,8 +97,11 @@ def camera_path(cfg: dict, clip: dict, info: dict, scene_cuts: list[float]) -> d
     crop_frac = (src_h * 9 / 16) / src_w  # crop width as a fraction of source width
     half = crop_frac / 2
 
+    if det.kind == "none":
+        return {"mode": "blur", "coverage": 0.0, "keyframes": [], "detector": "none"}
+
     centers: list[float | None] = []
-    for frame in _frames(clip["source"], clip["start"], clip["duration"], pw, ph):
+    for frame in _sample(clip["source"], clip["start"], clip["duration"], pw, ph, hw_decode_flags(info)):
         faces = det(frame)
         if not faces:
             centers.append(None)
@@ -143,23 +157,38 @@ def camera_path(cfg: dict, clip: dict, info: dict, scene_cuts: list[float]) -> d
     return {"mode": "crop", "coverage": round(coverage, 3), "keyframes": keyframes, "detector": det.kind, "shots": len(bounds) - 1}
 
 
-def crop_x_expr(keyframes: list[tuple[float, float]], src_w: int, crop_w: int, scene_cut_rel: list[float]) -> str:
-    """ffmpeg expression for crop x(t): piecewise-linear between keyframes, hard jump at scene cuts."""
+def write_sendcmd(
+    keyframes: list[tuple[float, float]], src_w: int, crop_w: int, scene_cut_rel: list[float], out: Path
+) -> tuple[Path, float]:
+    """Write an ffmpeg `sendcmd` file that re-targets crop@cam's x expression per keyframe interval.
+
+    ffmpeg caps the length of a single filter option, so one giant piecewise expression breaks on
+    clips longer than ~30s. sendcmd sends a short linear expression at each interval instead:
+    piecewise-linear pans between keyframes, hard jumps across scene cuts.
+    Returns (path, initial_x).
+    """
+    x_max = src_w - crop_w
     if not keyframes:
-        return str((src_w - crop_w) // 2)
+        out.write_text("")
+        return out, x_max / 2
     cut_set = set(round(c * SAMPLE_FPS) / SAMPLE_FPS for c in scene_cut_rel)
-    # Reduce keyframe density: one per 0.4s is plenty for a smooth path and keeps the expression short.
-    step = 2
+    step = 2  # one command per 0.4s is plenty for a smooth path
     kfs = keyframes[::step] + ([keyframes[-1]] if (len(keyframes) - 1) % step else [])
-    terms = []
+
+    def px(c: float) -> float:
+        return min(max(c * src_w - crop_w / 2, 0.0), float(x_max))
+
+    lines = []
     for (t0, c0), (t1, c1) in zip(kfs[:-1], kfs[1:]):
-        x0 = c0 * src_w - crop_w / 2
-        x1 = c1 * src_w - crop_w / 2
+        x0, x1 = px(c0), px(c1)
         jump = any(t0 < c <= t1 for c in cut_set)
         if jump or abs(x1 - x0) < 0.5:
-            terms.append(f"gte(t,{t0})*lt(t,{t1})*{x0:.1f}")
+            expr = f"{x0:.1f}"
         else:
-            terms.append(f"gte(t,{t0})*lt(t,{t1})*({x0:.1f}+({x1 - x0:.1f})*(t-{t0})/{t1 - t0:.3f})")
+            expr = f"{x0:.1f}+({x1 - x0:.1f})*(t-{t0})/{t1 - t0:.3f}"
+        lines.append(f"{t0:.3f}-{t1:.3f} [enter] crop@cam x '{expr}';")
     tl, cl = kfs[-1]
-    terms.append(f"gte(t,{tl})*{cl * src_w - crop_w / 2:.1f}")
-    return "min(max(" + "+".join(terms) + f",0),{src_w - crop_w})"
+    lines.append(f"{tl:.3f} [enter] crop@cam x '{px(cl):.1f}';")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines) + "\n")
+    return out, px(kfs[0][1])

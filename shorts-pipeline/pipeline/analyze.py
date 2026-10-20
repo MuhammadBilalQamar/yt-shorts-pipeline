@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .common import log, read_json, work_path, write_json
+from .common import hw_decode_flags, log, read_json, video_info, work_path, write_json
 
 WINDOW = 0.5  # seconds per energy bin
 
@@ -35,7 +35,8 @@ _PTS_RE = re.compile(r"pts_time:([0-9.]+)")
 def scene_cuts(src: str | Path, threshold: float = 0.3) -> list[float]:
     vf = f"scale=320:-2,select='gt(scene,{threshold})',showinfo"
     base = ["ffmpeg", "-v", "info", "-nostats"]
-    for hw in (["-hwaccel", "videotoolbox"], []):
+    hw_pref = hw_decode_flags(video_info(src))
+    for hw in ([hw_pref, []] if hw_pref else [[]]):
         cmd = base + hw + ["-i", str(src), "-an", "-vf", vf, "-f", "null", "-"]
         try:
             res = subprocess.run(cmd, text=True, capture_output=True, check=True)

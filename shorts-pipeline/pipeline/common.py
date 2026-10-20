@@ -21,6 +21,9 @@ def setup_logging(verbose: bool = False) -> None:
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
+    # Third-party loggers that flood DEBUG output (numba dumps whole IR listings).
+    for name in ("numba", "urllib3", "httpx", "httpcore", "filelock", "PIL", "googleapiclient", "google"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def load_config(path: str | Path | None = None) -> dict[str, Any]:
@@ -94,7 +97,16 @@ def video_info(path: str | Path) -> dict:
         "fps": fps,
         "duration": float(info["format"].get("duration", 0.0)),
         "rotation": int((v.get("tags") or {}).get("rotate", 0) or 0),
+        "codec": v.get("codec_name", ""),
     }
+
+
+# Codecs Apple Silicon can decode in hardware via VideoToolbox. AV1/VP9 fall back to software.
+_VT_CODECS = {"h264", "hevc", "prores", "mpeg4", "mpeg2video"}
+
+
+def hw_decode_flags(info: dict) -> list[str]:
+    return ["-hwaccel", "videotoolbox"] if info.get("codec") in _VT_CODECS else []
 
 
 def slugify(text: str, max_len: int = 60) -> str:
