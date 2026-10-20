@@ -1,0 +1,9 @@
+yt-dlp
+numpy
+opencv-python
+pyyaml
+requests
+mlx-whisper ; platform_machine == "arm64" and sys_platform == "darwin"
+faster-whisper
+google-api-python-client
+google-auth-oauthlib

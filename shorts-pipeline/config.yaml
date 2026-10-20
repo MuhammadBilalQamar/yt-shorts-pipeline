@@ -1,0 +1,104 @@
+# Shorts pipeline configuration. Every value can be overridden on the CLI.
+
+channel:
+  url: "https://www.youtube.com/@MrBeast"
+  handle: "@MrBeast"
+  # How many most-recent uploads to pull metadata for when building the catalog.
+  catalog_limit: 300
+  # Top-N videos (after ranking) that get clipped.
+  top_n: 10
+
+paths:
+  # Folder on this Mac containing the long-form source files (masters/exports).
+  source_dir: "./source"
+  work_dir: "./work"
+  output_dir: "./output"
+  # Optional CSV mapping: video_id,filename  (used before fuzzy title matching)
+  manifest: "./source/manifest.csv"
+
+ranking:
+  # Weights for the composite virality score. All components are normalised 0..1
+  # against the catalog before weighting.
+  weights:
+    views_per_day: 0.45     # view velocity: views / days since upload
+    views_total: 0.25
+    like_ratio: 0.15        # likes / views
+    comment_ratio: 0.15     # comments / views
+  # Ignore uploads newer than this; velocity is noisy in the first days.
+  min_age_days: 3
+  # Skip existing Shorts and anything too short to clip from.
+  min_duration_sec: 180
+
+sources:
+  # If a ranked video has no local file, download it with yt-dlp (1080p max).
+  allow_download: false
+  download_format: "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]"
+  # Minimum fuzzy-match ratio (0..1) for title -> filename matching.
+  match_threshold: 0.72
+
+transcribe:
+  # mlx (Metal) is used automatically when available, else faster-whisper on CPU.
+  mlx_model: "mlx-community/whisper-large-v3-turbo"
+  faster_whisper_model: "small"
+  language: "en"
+
+segments:
+  min_len: 28
+  target_len: 42
+  max_len: 58
+  # Candidates per video sent to the local LLM for re-ranking.
+  llm_candidates: 12
+  # Shorts kept per video after ranking.
+  clips_per_video: 3
+  # Minimum gap between two clips from the same video (seconds).
+  min_gap: 20
+
+llm:
+  # Local only. Set enabled: false to use the heuristic scorer alone.
+  enabled: true
+  provider: "ollama"
+  host: "http://localhost:11434"
+  model: "llama3.1:8b"
+  timeout_sec: 120
+
+render:
+  width: 1080
+  height: 1920
+  fps: 30
+  # "auto" picks crop (face tracked) or blur (pillarbox) per clip.
+  mode: "auto"
+  # If tracked subjects are on-screen for less than this fraction of frames, use blur mode.
+  crop_min_face_coverage: 0.55
+  # Smoothing window (seconds) for the camera path.
+  crop_smoothing_sec: 1.2
+  codec: "libx264"       # or h264_videotoolbox for ~5x faster, slightly lower quality
+  crf: 18
+  audio_lufs: -14
+  captions:
+    font: "Arial Black"
+    size: 78
+    words_per_line: 3
+    highlight_color: "&H0000F0FF"   # ASS BGR: yellow
+    base_color: "&H00FFFFFF"
+    outline: 5
+    margin_v: 420                   # px from bottom, keeps text above the Shorts UI
+    hook_banner: true               # show the hook line at the top for the first ~2.5s
+  cta:
+    enabled: true
+    seconds: 2.0
+    text: "Full video on {handle}"
+
+upload:
+  client_secret: "./secrets/client_secret.json"
+  token_file: "./secrets/token.json"
+  privacy: "private"           # private | unlisted | public
+  category_id: "24"            # Entertainment
+  # Minutes between scheduled publishes when draining the queue.
+  schedule_gap_min: 180
+  tags: ["shorts", "mrbeast"]
+  description_template: |
+    {hook}
+
+    Watch the full video: {video_url}
+
+    #shorts

@@ -1,0 +1,93 @@
+"""Render a scored segment into a captioned 1080x1920 Short with ffmpeg."""
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+from .captions import build_ass
+from .common import log, output_path, run, slugify, video_info, work_path, write_json
+from .reframe import camera_path, crop_x_expr
+
+
+def _ass_arg(path: Path) -> str:
+    s = str(path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    return f"ass=filename='{s}'"
+
+
+def _vf(cfg: dict, clip: dict, path: dict, info: dict, ass: Path) -> str:
+    r = cfg["render"]
+    W, H, fps = r["width"], r["height"], r["fps"]
+    if path["mode"] == "crop":
+        crop_w = int(round(info["height"] * 9 / 16 / 2) * 2)
+        cuts_rel = [c - clip["start"] for c in clip.get("_scene_cuts", []) if clip["start"] < c < clip["end"]]
+        expr = crop_x_expr(path["keyframes"], info["width"], crop_w, cuts_rel)
+        return (
+            f"crop=w={crop_w}:h={info['height']}:x='{expr}':y=0,"
+            f"scale={W}:{H}:flags=lanczos,fps={fps},format=yuv420p,{_ass_arg(ass)}"
+        )
+    return (
+        f"split=2[bg][fg];"
+        f"[bg]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},gblur=sigma=28,eq=brightness=-0.08[bgb];"
+        f"[fg]scale={W}:-2:flags=lanczos[fgs];"
+        f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2,fps={fps},format=yuv420p,{_ass_arg(ass)}"
+    )
+
+
+def render_clip(cfg: dict, clip: dict, transcript: dict, analysis: dict, force: bool = False) -> dict:
+    r = cfg["render"]
+    vid = clip["video_id"]
+    base = f"{clip.get('video_rank', 0):02d}-{slugify(clip['video_title'], 40)}-c{clip['clip_rank']}"
+    out_mp4 = output_path(cfg, vid, base + ".mp4")
+    out_json = output_path(cfg, vid, base + ".json")
+    if out_mp4.exists() and not force:
+        log.info("exists, skipping: %s", out_mp4.name)
+        return {**clip, "output": str(out_mp4)}
+
+    info = video_info(clip["source"])
+    clip["_scene_cuts"] = analysis["scene_cuts"]
+    log.info("Tracking subject for %s [%s-%s]", base, clip["start"], clip["end"])
+    path = camera_path(cfg, clip, info, analysis["scene_cuts"])
+    log.info("  reframe mode=%s coverage=%.0f%% detector=%s", path["mode"], path["coverage"] * 100, path["detector"])
+
+    ass = build_ass(cfg, clip, transcript, work_path(cfg, "ass", f"{vid}-c{clip['clip_rank']}.ass"))
+    vf = _vf(cfg, clip, path, info, ass)
+
+    if r["codec"] == "h264_videotoolbox":
+        venc = ["-c:v", "h264_videotoolbox", "-b:v", "12M", "-profile:v", "high", "-allow_sw", "1"]
+    else:
+        venc = ["-c:v", "libx264", "-crf", str(r["crf"]), "-preset", "medium", "-profile:v", "high", "-level", "4.2"]
+    af = f"loudnorm=I={r['audio_lufs']}:TP=-1.5:LRA=11,aresample=48000"
+
+    for hw in (["-hwaccel", "videotoolbox"], []):
+        cmd = (
+            ["ffmpeg", "-v", "error", "-y"] + hw
+            + ["-ss", f"{clip['start']:.3f}", "-t", f"{clip['duration']:.3f}", "-i", clip["source"]]
+            + ["-vf" if path["mode"] == "crop" else "-filter_complex", vf]
+            + venc + ["-af", af, "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", "-shortest", str(out_mp4)]
+        )
+        log.info("  encoding %s (%s)", out_mp4.name, "videotoolbox decode" if hw else "software decode")
+        res = subprocess.run(cmd, text=True, capture_output=True)
+        if res.returncode == 0:
+            break
+        if hw:
+            log.debug("hw decode failed, retrying software: %s", res.stderr[-400:])
+            continue
+        raise RuntimeError(f"ffmpeg failed for {base}:\n{res.stderr[-2000:]}")
+
+    poster = output_path(cfg, vid, base + ".jpg")
+    run(["ffmpeg", "-v", "error", "-y", "-ss", "0.6", "-i", out_mp4, "-frames:v", "1", "-q:v", "3", poster], check=False)
+
+    meta = {k: v for k, v in clip.items() if not k.startswith("_")}
+    meta.update({"output": str(out_mp4), "poster": str(poster), "reframe": {k: v for k, v in path.items() if k != "keyframes"}})
+    meta["title"] = (clip.get("llm") or {}).get("title") or _fallback_title(clip)
+    meta["description"] = cfg["upload"]["description_template"].format(
+        hook=(clip.get("llm") or {}).get("hook_line") or clip["hook_line"], video_url=clip.get("video_url") or ""
+    ).strip()
+    write_json(out_json, meta)
+    log.info("  done: %s", out_mp4)
+    return meta
+
+
+def _fallback_title(clip: dict) -> str:
+    hook = " ".join(clip["hook_line"].split()[:9]).rstrip(".,!?")
+    return hook[:55] if hook else clip["video_title"][:55]
